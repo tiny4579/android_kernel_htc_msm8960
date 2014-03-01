@@ -19,6 +19,7 @@
 #include <linux/rtc.h>
 #include <linux/wakelock.h>
 #include <linux/workqueue.h>
+#include <linux/cpu.h>
 
 #include "power.h"
 
@@ -43,6 +44,54 @@ enum {
 	SUSPEND_REQUESTED_AND_SUSPENDED = SUSPEND_REQUESTED | SUSPENDED,
 };
 static int state;
+
+#ifdef CONFIG_EARLYSUSPEND_BOOST_CPU_SPEED
+
+extern int skip_cpu_offline;
+int has_boost_cpu_func = 0;
+
+static void __ref boost_cpu_speed(int boost)
+{
+	unsigned long max_wait;
+	unsigned int cpu = 0, isfound = 0;
+
+	if (!has_boost_cpu_func)
+		return;
+
+	if (boost) {
+		skip_cpu_offline = 1;
+
+		for(cpu = 1; cpu < NR_CPUS; cpu++) {
+			if (cpu_online(cpu)) {
+				isfound = 1;
+				break;
+			}
+		}
+		cpu = isfound ? cpu : 1;
+
+		if (!isfound) {
+			max_wait = jiffies + msecs_to_jiffies(50);
+			cpu_hotplug_driver_lock();
+			cpu_up(cpu);
+			cpu_hotplug_driver_unlock();
+			while (!cpu_active(cpu) && jiffies < max_wait)
+				;
+		}
+#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND
+		ondemand_boost_cpu(1);
+#endif
+
+	} else {
+
+#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND
+		ondemand_boost_cpu(0);
+#endif
+		skip_cpu_offline = 0;
+	}
+}
+#else
+static void boost_cpu_speed(int boost) { return; }
+#endif
 
 void register_early_suspend(struct early_suspend *handler)
 {
@@ -91,6 +140,8 @@ static void early_suspend(struct work_struct *work)
 		goto abort;
 	}
 
+	boost_cpu_speed(1);
+
 	if (debug_mask & DEBUG_SUSPEND)
 		pr_info("early_suspend: call handlers\n");
 	list_for_each_entry(pos, &early_suspend_handlers, link) {
@@ -100,6 +151,7 @@ static void early_suspend(struct work_struct *work)
 			pos->suspend(pos);
 		}
 	}
+	boost_cpu_speed(0);
 	mutex_unlock(&early_suspend_lock);
 
 	suspend_sys_sync_queue();
@@ -129,6 +181,7 @@ static void late_resume(struct work_struct *work)
 			pr_info("late_resume: abort, state %d\n", state);
 		goto abort;
 	}
+	boost_cpu_speed(1);
 	if (debug_mask & DEBUG_SUSPEND)
 		pr_info("late_resume: call handlers\n");
 	list_for_each_entry_reverse(pos, &early_suspend_handlers, link) {
@@ -139,6 +192,7 @@ static void late_resume(struct work_struct *work)
 			pos->resume(pos);
 		}
 	}
+	boost_cpu_speed(0);
 	if (debug_mask & DEBUG_SUSPEND)
 		pr_info("late_resume: done\n");
 abort:
